@@ -10,6 +10,7 @@ import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:camera/camera.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 
 // =============================================================================
@@ -50,6 +51,277 @@ class _DS {
   // Bubble
   static const bubbleRadius = 14.0;
   static const ringCount    = 3;             // concentric rings in Bull's Eye
+}
+
+// =============================================================================
+//  SURVEYOR — STATE MACHINE
+// =============================================================================
+
+/// Drives the entire AR Surveyor flow as a pure state enum.
+///
+/// Transitions:
+///   idle → onboardingHeight  (first activation)
+///   idle → aimingBase        (subsequent activations, already calibrated)
+///   onboardingHeight → onboardingGuide
+///   onboardingGuide  → aimingBase    (camera starts here)
+///   aimingBase       → lockedBase    (user locks base distance)
+///   lockedBase       → result        (user locks top angle → height computed)
+///   result           → aimingBase    (remeasure)
+///   any              → idle          (deactivate)
+enum SurveyorState {
+  idle,
+  onboardingHeight,
+  onboardingGuide,
+  aimingBase,
+  lockedBase,
+  result,
+}
+
+// =============================================================================
+//  HEIGHT CALCULATOR  — Two-step trigonometric surveyor math
+// =============================================================================
+
+/// Implements the classical two-angle height measurement technique.
+///
+/// Geometry (phone held at [userHeight] above the ground):
+///
+///   TOP ────────────────────┐
+///                           │ H = object height (unknown)
+///   Phone ── d ─────── Base┘
+///
+///   Step 1 (aim DOWN at base):
+///     tan(α) = userHeight / d   →   d = userHeight / tan(α)
+///
+///   Step 2 (aim UP at top):
+///     H = userHeight + d × tan(β)
+///
+/// where α = |downward pitch angle|, β = |upward pitch angle|.
+class HeightCalculator {
+  const HeightCalculator({required this.userHeightM});
+
+  /// Eye-level / holding height in metres.
+  final double userHeightM;
+
+  static const double _minAngleDeg = 1.5; // guard: < 1.5° is near-horizontal
+
+  bool isAngleValid(double pitchDeg) => pitchDeg.abs() >= _minAngleDeg;
+
+  /// Step 1 — horizontal distance to the target base (metres).
+  double distance(double pitchDeg) {
+    final rad = pitchDeg.abs() * math.pi / 180.0;
+    return userHeightM / math.tan(rad);
+  }
+
+  /// Step 2 — total object height (metres), given the locked [distanceM].
+  double objectHeight(double pitchDeg, double distanceM) {
+    final rad = pitchDeg.abs() * math.pi / 180.0;
+    return userHeightM + distanceM * math.tan(rad);
+  }
+}
+
+// =============================================================================
+//  SURVEYOR CONTROLLER  — Camera lifecycle + state machine
+// =============================================================================
+
+/// Manages the AR Surveyor tool: camera, onboarding, two-step measurement.
+///
+/// Render contract:
+///   - [cameraCtrl] is exposed read-only for [CameraPreview].
+///   - [cameraReady] is the ONLY notifier the camera preview observes; it
+///     fires ONLY on user action (not at sensor frequency) — safe as a VLB.
+///   - Heavy-computation widgets observe [pitch] from [LevelController] directly
+///     and call [HeightCalculator] inline — no sensor-tick notifiers in here.
+class SurveyorController {
+  // ── Public state notifiers ────────────────────────────────────────────────
+
+  /// Current surveyor workflow state.
+  final ValueNotifier<SurveyorState> state =
+      ValueNotifier(SurveyorState.idle);
+
+  /// true once [CameraController.initialize()] has completed successfully.
+  final ValueNotifier<bool> cameraReady = ValueNotifier(false);
+
+  /// Locked horizontal distance (metres) from Step 1. Null until locked.
+  final ValueNotifier<double?> lockedDistance = ValueNotifier(null);
+
+  /// Final measured object height (metres). Null until Step 2 is locked.
+  final ValueNotifier<double?> measuredHeight = ValueNotifier(null);
+
+  /// Non-null when camera initialisation fails.
+  final ValueNotifier<String?> cameraError = ValueNotifier(null);
+
+  /// Flashlight / Torch toggle state.
+  final ValueNotifier<bool> isTorchOn = ValueNotifier(false);
+
+  // ── Public camera controller (read-only, null until ready) ───────────────
+  CameraController? cameraCtrl;
+
+  // ── Calibration ───────────────────────────────────────────────────────────
+
+  /// User-entered holding height in metres.
+  double userHeightM = 1.65;
+
+  bool _hasOnboarded = false;
+
+  /// Whether user has completed initial onboarding.
+  bool get hasOnboarded => _hasOnboarded;
+
+  /// Access the calculator with the current user height.
+  HeightCalculator get calc => HeightCalculator(userHeightM: userHeightM);
+
+  // ── Activation ───────────────────────────────────────────────────────────
+
+  /// Entry point: called when the SURVEYOR dock button is tapped.
+  void activate() {
+    if (!_hasOnboarded) {
+      state.value = SurveyorState.onboardingHeight;
+    } else {
+      state.value = SurveyorState.aimingBase;
+      _startCamera();
+    }
+  }
+
+  /// Re-opens height calibration modal to overwrite userHeight.
+  void editHeight() {
+    state.value = SurveyorState.onboardingHeight;
+  }
+
+  /// Toggles camera torch mode safely using official camera package API.
+  Future<void> toggleTorch() async {
+    final ctrl = cameraCtrl;
+    if (ctrl == null || !ctrl.value.isInitialized) {
+      debugPrint('[Flashlight] Camera is not initialized.');
+      return;
+    }
+    try {
+      if (isTorchOn.value) {
+        await ctrl.setFlashMode(FlashMode.off);
+        isTorchOn.value = false;
+      } else {
+        await ctrl.setFlashMode(FlashMode.torch);
+        isTorchOn.value = true;
+      }
+    } catch (e) {
+      debugPrint('[Flashlight] Error setting flash mode: $e');
+    }
+  }
+
+  /// Exits surveyor mode and stops the camera.
+  void deactivate() {
+    _stopCamera();
+    lockedDistance.value = null;
+    measuredHeight.value = null;
+    cameraError.value = null;
+    state.value = SurveyorState.idle;
+  }
+
+  // ── Onboarding ────────────────────────────────────────────────────────────
+
+  /// Called when the user confirms their height on Screen 1.
+  void completeHeightEntry(double heightM) {
+    userHeightM = heightM;
+    if (_hasOnboarded) {
+      state.value = SurveyorState.aimingBase;
+      if (cameraCtrl == null || !cameraCtrl!.value.isInitialized) {
+        _startCamera();
+      }
+    } else {
+      state.value = SurveyorState.onboardingGuide;
+    }
+  }
+
+  /// Called when the user taps "Start" on Screen 2 (the guide).
+  Future<void> startFromGuide() async {
+    _hasOnboarded = true;
+    state.value = SurveyorState.aimingBase;
+    await _startCamera();
+  }
+
+  // ── Measurement ──────────────────────────────────────────────────────────
+
+  /// Step 1 LOCK — stores the distance and advances to lockedBase.
+  /// Requires pitch to be tilted down ≥ 1.5° for a valid reading.
+  void lockBase(double pitchDeg) {
+    if (!calc.isAngleValid(pitchDeg)) return;
+    final d = calc.distance(pitchDeg);
+    if (d <= 0 || d.isInfinite || d.isNaN) return;
+    lockedDistance.value = d;
+    state.value = SurveyorState.lockedBase;
+    HapticFeedback.heavyImpact();
+    debugPrint('[Surveyor] Base locked — distance: ${d.toStringAsFixed(3)} m');
+  }
+
+  /// Step 2 LOCK — computes final height and advances to result.
+  /// Requires pitch to be tilted up ≥ 1.5° for a valid reading.
+  void lockTop(double pitchDeg) {
+    final d = lockedDistance.value;
+    if (d == null || !calc.isAngleValid(pitchDeg)) return;
+    final h = calc.objectHeight(pitchDeg, d);
+    measuredHeight.value = h;
+    state.value = SurveyorState.result;
+    HapticFeedback.heavyImpact();
+    debugPrint('[Surveyor] Top locked — height: ${h.toStringAsFixed(3)} m');
+  }
+
+  /// Resets to Step 1 to allow remeasurement of the same target.
+  void remeasure() {
+    lockedDistance.value = null;
+    measuredHeight.value = null;
+    state.value = SurveyorState.aimingBase;
+  }
+
+  // ── Camera lifecycle ──────────────────────────────────────────────────────
+
+  Future<void> _startCamera() async {
+    try {
+      final cameras = await availableCameras();
+      if (cameras.isEmpty) {
+        cameraError.value = 'No camera detected on this device.';
+        return;
+      }
+      final back = cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.back,
+        orElse: () => cameras.first,
+      );
+      cameraCtrl = CameraController(
+        back,
+        ResolutionPreset.high,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.jpeg,
+      );
+      await cameraCtrl!.initialize();
+      cameraReady.value = true;
+      debugPrint('[Surveyor] Camera ready.');
+    } on CameraException catch (e) {
+      cameraError.value = e.code == 'cameraPermission'
+          ? 'Camera permission denied.\n\nGo to Settings → Apps → Bubble Level → Permissions and enable Camera.'
+          : 'Camera error: ${e.description}';
+      debugPrint('[Surveyor] CameraException: ${e.code} — ${e.description}');
+    }
+  }
+
+  void _stopCamera() {
+    if (isTorchOn.value) {
+      isTorchOn.value = false;
+    }
+    cameraCtrl?.dispose();
+    cameraCtrl = null;
+    cameraReady.value = false;
+    debugPrint('[Surveyor] Camera released.');
+  }
+
+  // ── Dispose ───────────────────────────────────────────────────────────────
+
+  void dispose() {
+    _stopCamera();
+    state.dispose();
+    cameraReady.dispose();
+    lockedDistance.dispose();
+    measuredHeight.dispose();
+    cameraError.dispose();
+    isTorchOn.dispose();
+    debugPrint('[SurveyorController] Disposed.');
+  }
 }
 
 // =============================================================================
@@ -99,98 +371,241 @@ class LevelPage extends StatefulWidget {
 
 class _LevelPageState extends State<LevelPage> {
   late final LevelController _ctrl;
+  late final SurveyorController _surveyorCtrl;
 
-  // Local state for the viscosity slider — uses setState because it only
-  // rebuilds the Dock widget (cheap), not the sensor path.
+  // Viscosity slider — setState is safe here: it only rebuilds the dock,
+  // never the sensor path or camera layer.
   double _alpha = 0.5;
 
   @override
   void initState() {
     super.initState();
     _ctrl = LevelController()..init();
+    _surveyorCtrl = SurveyorController();
   }
 
   @override
   void dispose() {
+    _surveyorCtrl.dispose();
     _ctrl.dispose();
     super.dispose();
   }
 
-  void _onAlphaChanged(double v) {
-    setState(() {
-      _alpha = v;
-      _ctrl.alpha = v;
-    });
-  }
+  void _onAlphaChanged(double v) => setState(() {
+        _alpha = v;
+        _ctrl.alpha = v;
+      });
+
+  // Convenience: is the user actively measuring (not idle / onboarding)?
+  bool _isActiveSurveyor(SurveyorState s) =>
+      s == SurveyorState.aimingBase ||
+      s == SurveyorState.lockedBase ||
+      s == SurveyorState.result;
 
   @override
   Widget build(BuildContext context) {
-    final size = MediaQuery.sizeOf(context);
-
     return Scaffold(
       backgroundColor: _DS.obsidian,
+      // Prevent the keyboard from resizing the canvas (height input field).
+      resizeToAvoidBottomInset: false,
       body: Stack(
         children: [
-          // ── Layer 0 : Static edge rulers (never re-render) ─────────────────
+          // ══════════════════════════════════════════════════════════════════
+          //  LAYER 0 — Camera preview
+          //  CameraPreview sits at the absolute base of the stack.
+          //  cameraReady fires ONLY on user action — never at sensor frequency.
+          //  RULE: this Positioned must NEVER be inside a high-frequency VLB.
+          // ══════════════════════════════════════════════════════════════════
           Positioned.fill(
-            child: ValueListenableBuilder<RulerMetrics>(
-              valueListenable: _ctrl.rulerMetrics,
-              builder: (context, metrics, _) => CustomPaint(
-                painter: _RulerPainter(metrics: metrics),
+            child: ValueListenableBuilder<bool>(
+              valueListenable: _surveyorCtrl.cameraReady,
+              builder: (_, ready, _) {
+                if (!ready || _surveyorCtrl.cameraCtrl == null) {
+                  return const SizedBox.shrink();
+                }
+                return CameraPreview(_surveyorCtrl.cameraCtrl!);
+              },
+            ),
+          ),
+
+          // ── Obsidian overlay — fades to 40 % when camera is live ───────────
+          // Keeps the ruler + glass panels readable over the raw camera feed.
+          Positioned.fill(
+            child: ValueListenableBuilder<bool>(
+              valueListenable: _surveyorCtrl.cameraReady,
+              builder: (_, ready, _) => IgnorePointer(
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 600),
+                  color: _DS.obsidian.withAlpha(ready ? 102 : 255), // 40% / 100%
+                ),
               ),
             ),
           ),
 
-          // ── Layer 1 : Level display — animated crossfade on mode switch ───
-          // isSurfaceMode only fires when crossing the 45° threshold (rare),
-          // so the AnimatedSwitcher never triggers during the hot sensor path.
+          // ══════════════════════════════════════════════════════════════════
+          //  LAYER 1 — Static edge rulers (fires once per app start)
+          // ══════════════════════════════════════════════════════════════════
+          Positioned.fill(
+            child: ValueListenableBuilder<RulerMetrics>(
+              valueListenable: _ctrl.rulerMetrics,
+              builder: (_, metrics, _) =>
+                  CustomPaint(painter: _RulerPainter(metrics: metrics)),
+            ),
+          ),
+
+          // ══════════════════════════════════════════════════════════════════
+          //  LAYER 2 — Level canvas (hidden in active surveyor mode)
+          // ══════════════════════════════════════════════════════════════════
           Positioned(
             left: _DS.rulerWidth,
             right: _DS.rulerWidth,
             top: 0,
             bottom: 0,
-            child: ValueListenableBuilder<bool>(
-              valueListenable: _ctrl.isSurfaceMode,
-              builder: (context, isSurface, _) => AnimatedSwitcher(
-                duration: const Duration(milliseconds: 300),
-                // FadeTransition: no layout jump, pure opacity cross-dissolve.
-                transitionBuilder: (child, animation) => FadeTransition(
-                  opacity: animation,
-                  child: child,
-                ),
-                // StackFit.expand propagates tight constraints so CustomPaint
-                // fills the space without an explicit SizedBox.expand() wrapper.
-                layoutBuilder: (currentChild, previousChildren) => Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    ...previousChildren,
-                    ?currentChild,
-                  ],
-                ),
-                child: isSurface
-                    ? _BullsEyeCanvas(key: const ValueKey(true),  ctrl: _ctrl)
-                    : _TubularCanvas(key: const ValueKey(false), ctrl: _ctrl),
-              ),
+            child: ValueListenableBuilder<SurveyorState>(
+              valueListenable: _surveyorCtrl.state,
+              builder: (_, sState, _) {
+                if (_isActiveSurveyor(sState)) return const SizedBox.shrink();
+                return ValueListenableBuilder<bool>(
+                  valueListenable: _ctrl.isSurfaceMode,
+                  builder: (_, isSurface, _) => AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 300),
+                    transitionBuilder: (child, anim) =>
+                        FadeTransition(opacity: anim, child: child),
+                    layoutBuilder: (cur, prev) => Stack(
+                      fit: StackFit.expand,
+                      children: [...prev, ?cur],
+                    ),
+                    child: isSurface
+                        ? _BullsEyeCanvas(
+                            key: const ValueKey(true), ctrl: _ctrl)
+                        : _TubularCanvas(
+                            key: const ValueKey(false), ctrl: _ctrl),
+                  ),
+                );
+              },
             ),
           ),
 
-          // ── Layer 2 : Inclinometer readout (surgical text rebuild) ─────────
+          // ══════════════════════════════════════════════════════════════════
+          //  LAYER 3 — Surveyor crosshair (visible in aimingBase / lockedBase)
+          //  CrosshairPainter is static — no sensor VLB needed.
+          // ══════════════════════════════════════════════════════════════════
           Positioned(
-            top: size.height * 0.12,
-            left: _DS.rulerWidth + 16,
-            right: _DS.rulerWidth + 16,
-            child: _InclinometerReadout(ctrl: _ctrl),
+            left: _DS.rulerWidth,
+            right: _DS.rulerWidth,
+            top: 0,
+            bottom: 0,
+            child: ValueListenableBuilder<SurveyorState>(
+              valueListenable: _surveyorCtrl.state,
+              builder: (_, sState, _) {
+                final show = sState == SurveyorState.aimingBase ||
+                    sState == SurveyorState.lockedBase;
+                if (!show) return const SizedBox.shrink();
+                return CustomPaint(
+                  painter: _CrosshairPainter(
+                    isLocked: sState == SurveyorState.lockedBase,
+                  ),
+                );
+              },
+            ),
           ),
 
-          // ── Layer 3 : Glassmorphic Pro-Tools Dock (static blur) ────────────
+          // ══════════════════════════════════════════════════════════════════
+          //  LAYER 4 — Top Navigation Controls (Flashlight & Surveyor Exit)
+          // ══════════════════════════════════════════════════════════════════
+          Positioned(
+            top: 20,
+            left: _DS.rulerWidth + 12,
+            right: _DS.rulerWidth + 12,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                // Global Flashlight Toggle (Top-Left)
+                _FlashlightButton(surveyorCtrl: _surveyorCtrl),
+
+                // Surveyor Exit Navigation (Top-Right, only when active)
+                ValueListenableBuilder<SurveyorState>(
+                  valueListenable: _surveyorCtrl.state,
+                  builder: (_, sState, _) {
+                    if (!_isActiveSurveyor(sState)) {
+                      return const SizedBox.shrink();
+                    }
+                    return _SurveyorCloseButton(
+                      onTap: () {
+                        HapticFeedback.selectionClick();
+                        _surveyorCtrl.deactivate();
+                      },
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
+
+          // ══════════════════════════════════════════════════════════════════
+          //  LAYER 5 — Top panel: inclinometer OR surveyor readings
+          //  Switches based on surveyor state (fires on user action only).
+          //  The hot-path (20 Hz pitch VLB) lives INSIDE the child widgets.
+          // ══════════════════════════════════════════════════════════════════
+          Positioned(
+            top: 76,
+            left: _DS.rulerWidth + 12,
+            right: _DS.rulerWidth + 12,
+            child: ValueListenableBuilder<SurveyorState>(
+              valueListenable: _surveyorCtrl.state,
+              builder: (_, sState, _) {
+                if (_isActiveSurveyor(sState)) {
+                  return _SurveyorTopPanel(
+                    surveyorCtrl: _surveyorCtrl,
+                    levelCtrl: _ctrl,
+                  );
+                }
+                return _InclinometerReadout(ctrl: _ctrl);
+              },
+            ),
+          ),
+
+          // ══════════════════════════════════════════════════════════════════
+          //  LAYER 6 — Bottom: normal dock OR surveyor action panel
+          // ══════════════════════════════════════════════════════════════════
           Positioned(
             left: 0,
             right: 0,
             bottom: 0,
-            child: _ProToolsDock(
-              ctrl: _ctrl,
-              alpha: _alpha,
-              onAlphaChanged: _onAlphaChanged,
+            child: ValueListenableBuilder<SurveyorState>(
+              valueListenable: _surveyorCtrl.state,
+              builder: (_, sState, _) {
+                if (_isActiveSurveyor(sState)) {
+                  return _SurveyorBottomPanel(
+                    surveyorCtrl: _surveyorCtrl,
+                    levelCtrl: _ctrl,
+                    state: sState,
+                  );
+                }
+                return _ProToolsDock(
+                  ctrl: _ctrl,
+                  alpha: _alpha,
+                  onAlphaChanged: _onAlphaChanged,
+                  surveyorCtrl: _surveyorCtrl,
+                );
+              },
+            ),
+          ),
+
+          // ══════════════════════════════════════════════════════════════════
+          //  LAYER 6 — Onboarding overlay (full-screen, modal-like)
+          //  Only visible during the two onboarding states; removed otherwise.
+          // ══════════════════════════════════════════════════════════════════
+          Positioned.fill(
+            child: ValueListenableBuilder<SurveyorState>(
+              valueListenable: _surveyorCtrl.state,
+              builder: (_, sState, _) {
+                final show = sState == SurveyorState.onboardingHeight ||
+                    sState == SurveyorState.onboardingGuide;
+                if (!show) return const SizedBox.shrink();
+                return _SurveyorOnboardingOverlay(
+                    surveyorCtrl: _surveyorCtrl);
+              },
             ),
           ),
         ],
@@ -371,11 +786,13 @@ class _ProToolsDock extends StatelessWidget {
     required this.ctrl,
     required this.alpha,
     required this.onAlphaChanged,
+    required this.surveyorCtrl,
   });
 
   final LevelController ctrl;
   final double alpha;
   final ValueChanged<double> onAlphaChanged;
+  final SurveyorController surveyorCtrl;
 
   @override
   Widget build(BuildContext context) {
@@ -439,38 +856,58 @@ class _ProToolsDock extends StatelessWidget {
 
           // ── Action buttons ─────────────────────────────────────────────────
           Row(
-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
               // Tare / Set Baseline
-              _DockButton(
-                icon: Icons.straighten_rounded,
-                label: 'SET BASE',
-                onTap: () {
-                  ctrl.calibrate();
-                  HapticFeedback.selectionClick();
-                },
+              Expanded(
+                child: _DockButton(
+                  icon: Icons.straighten_rounded,
+                  label: 'SET BASE',
+                  onTap: () {
+                    ctrl.calibrate();
+                    HapticFeedback.selectionClick();
+                  },
+                ),
               ),
+              const SizedBox(width: 6),
 
               // Reset calibration
-              _DockButton(
-                icon: Icons.refresh_rounded,
-                label: 'RESET',
-                onTap: () {
-                  ctrl.resetCalibration();
-                  HapticFeedback.selectionClick();
-                },
+              Expanded(
+                child: _DockButton(
+                  icon: Icons.refresh_rounded,
+                  label: 'RESET',
+                  onTap: () {
+                    ctrl.resetCalibration();
+                    HapticFeedback.selectionClick();
+                  },
+                ),
               ),
+              const SizedBox(width: 6),
 
               // Lock / Freeze — only this button rebuilds
-              ValueListenableBuilder<bool>(
-                valueListenable: ctrl.isLocked,
-                builder: (context, locked, _) => _DockButton(
-                  icon: locked ? Icons.lock_rounded : Icons.lock_open_rounded,
-                  label: locked ? 'UNLOCK' : 'FREEZE',
-                  accent: locked ? _DS.amber : null,
+              Expanded(
+                child: ValueListenableBuilder<bool>(
+                  valueListenable: ctrl.isLocked,
+                  builder: (context, locked, _) => _DockButton(
+                    icon: locked ? Icons.lock_rounded : Icons.lock_open_rounded,
+                    label: locked ? 'UNLOCK' : 'FREEZE',
+                    accent: locked ? _DS.amber : null,
+                    onTap: () {
+                      ctrl.toggleLock();
+                      HapticFeedback.selectionClick();
+                    },
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+
+              // Surveyor — launches the AR measuring tool
+              Expanded(
+                child: _DockButton(
+                  icon: Icons.architecture_rounded,
+                  label: 'SURVEYOR',
                   onTap: () {
-                    ctrl.toggleLock();
                     HapticFeedback.selectionClick();
+                    surveyorCtrl.activate();
                   },
                 ),
               ),
@@ -503,7 +940,7 @@ class _DockButton extends StatelessWidget {
       onTap: onTap,
       behavior: HitTestBehavior.opaque,
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 10),
         decoration: BoxDecoration(
           color: _DS.glassWhite,
           borderRadius: BorderRadius.circular(14),
@@ -512,18 +949,74 @@ class _DockButton extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon, size: 22, color: color),
+            Icon(icon, size: 20, color: color),
             const SizedBox(height: 4),
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 9,
-                letterSpacing: 1.4,
-                color: color,
-                fontWeight: FontWeight.w600,
+            FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Text(
+                label,
+                maxLines: 1,
+                style: TextStyle(
+                  fontSize: 9,
+                  letterSpacing: 1.0,
+                  color: color,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Glassmorphic floating button for toggling flashlight/torch.
+class _FlashlightButton extends StatelessWidget {
+  const _FlashlightButton({required this.surveyorCtrl});
+  final SurveyorController surveyorCtrl;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<bool>(
+      valueListenable: surveyorCtrl.isTorchOn,
+      builder: (context, isOn, _) {
+        return GestureDetector(
+          onTap: () {
+            HapticFeedback.selectionClick();
+            surveyorCtrl.toggleTorch();
+          },
+          child: _GlassPanel(
+            borderRadius: BorderRadius.circular(14),
+            padding: const EdgeInsets.all(10),
+            child: Icon(
+              isOn ? Icons.flashlight_on_rounded : Icons.flashlight_off_rounded,
+              size: 20,
+              color: isOn ? _DS.amber : _DS.textDim,
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Glassmorphic "X" button for exiting Surveyor mode.
+class _SurveyorCloseButton extends StatelessWidget {
+  const _SurveyorCloseButton({required this.onTap});
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: _GlassPanel(
+        borderRadius: BorderRadius.circular(14),
+        padding: const EdgeInsets.all(10),
+        child: const Icon(
+          Icons.close_rounded,
+          size: 20,
+          color: _DS.textBright,
         ),
       ),
     );
@@ -541,6 +1034,7 @@ class _DockButton extends StatelessWidget {
 // =============================================================================
 class _GlassPanel extends StatelessWidget {
   const _GlassPanel({
+    super.key,
     required this.child,
     this.padding = const EdgeInsets.all(16),
     this.borderRadius = const BorderRadius.all(Radius.circular(20)),
@@ -659,6 +1153,1116 @@ class _GlassPanel extends StatelessWidget {
       ),
     );
   }
+}
+
+// =============================================================================
+//  SURVEYOR UI — ONBOARDING OVERLAY  (2-screen glassmorphic modal)
+// =============================================================================
+
+/// Full-screen overlay displayed during the two onboarding states.
+/// Stateful to own the height [TextEditingController] and unit toggle.
+class _SurveyorOnboardingOverlay extends StatefulWidget {
+  const _SurveyorOnboardingOverlay({required this.surveyorCtrl});
+  final SurveyorController surveyorCtrl;
+
+  @override
+  State<_SurveyorOnboardingOverlay> createState() =>
+      _SurveyorOnboardingOverlayState();
+}
+
+class _SurveyorOnboardingOverlayState
+    extends State<_SurveyorOnboardingOverlay> {
+  late final TextEditingController _heightCtrl;
+  bool _isMetric = true;
+  String? _validationError;
+
+  @override
+  void initState() {
+    super.initState();
+    _heightCtrl = TextEditingController(
+      text: widget.surveyorCtrl.userHeightM.toStringAsFixed(2),
+    );
+  }
+
+  @override
+  void dispose() {
+    _heightCtrl.dispose();
+    super.dispose();
+  }
+
+  // Convert current input to metres for storage.
+  double? _parsedMetres() {
+    final v = double.tryParse(_heightCtrl.text.trim());
+    if (v == null || v <= 0) return null;
+    return _isMetric ? v : v * 0.3048; // feet → metres
+  }
+
+  void _onUnitToggle(bool metric) {
+    final current = double.tryParse(_heightCtrl.text.trim()) ?? 1.65;
+    final converted = metric ? current * 0.3048 : current / 0.3048;
+    setState(() {
+      _isMetric = metric;
+      _heightCtrl.text = converted.toStringAsFixed(2);
+      _validationError = null;
+    });
+  }
+
+  void _onNext() {
+    final metres = _parsedMetres();
+    if (metres == null || metres < 0.5 || metres > 3.0) {
+      setState(() => _validationError =
+          'Enter a realistic height (${_isMetric ? "0.5–3.0 m" : "1.6–9.8 ft"})');
+      return;
+    }
+    widget.surveyorCtrl.completeHeightEntry(metres);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Dim the background (obsidian 70 %) and centre the glass card.
+    return Material(
+      color: _DS.obsidian.withAlpha(178),
+      child: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 24),
+            child: ValueListenableBuilder<SurveyorState>(
+              valueListenable: widget.surveyorCtrl.state,
+              builder: (_, state, _) => AnimatedSwitcher(
+                duration: const Duration(milliseconds: 380),
+                transitionBuilder: (child, anim) => SlideTransition(
+                  position: Tween<Offset>(
+                    begin: const Offset(0.12, 0),
+                    end: Offset.zero,
+                  ).animate(CurvedAnimation(
+                      parent: anim, curve: Curves.easeOutCubic)),
+                  child: FadeTransition(opacity: anim, child: child),
+                ),
+                child: state == SurveyorState.onboardingHeight
+                    ? _buildHeightScreen()
+                    : _buildGuideScreen(),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── Screen 1: Enter holding height ────────────────────────────────────────
+  Widget _buildHeightScreen() {
+    return _GlassPanel(
+      key: const ValueKey('screen_height'),
+      padding: const EdgeInsets.all(28),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header
+          Row(
+            children: [
+              Container(
+                width: 32,
+                height: 32,
+                decoration: BoxDecoration(
+                  color: _DS.emerald.withAlpha(30),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Icon(Icons.architecture_rounded,
+                    size: 18, color: _DS.emerald),
+              ),
+              const SizedBox(width: 12),
+              const Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('SURVEYOR',
+                      style: TextStyle(
+                          fontSize: 10,
+                          letterSpacing: 2.5,
+                          color: _DS.emerald,
+                          fontWeight: FontWeight.w600)),
+                  Text('Step 1 of 2 — Calibration',
+                      style: TextStyle(fontSize: 12, color: _DS.textDim)),
+                ],
+              ),
+              const Spacer(),
+              GestureDetector(
+                onTap: () {
+                  if (widget.surveyorCtrl.hasOnboarded) {
+                    widget.surveyorCtrl.state.value = SurveyorState.aimingBase;
+                  } else {
+                    widget.surveyorCtrl.deactivate();
+                  }
+                },
+                child: const Icon(Icons.close_rounded,
+                    color: _DS.textDim, size: 20),
+              ),
+            ],
+          ),
+
+          const SizedBox(height: 24),
+          const Text('Your holding height',
+              style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w300,
+                  color: _DS.textBright)),
+          const SizedBox(height: 6),
+          const Text(
+            'Enter the height at which you hold the phone '
+            '(eye level or arm raised).',
+            style: TextStyle(fontSize: 12, color: _DS.textDim, height: 1.5),
+          ),
+
+          const SizedBox(height: 20),
+
+          // Unit toggle
+          Row(
+            children: [
+              _UnitChip(
+                  label: 'm',
+                  selected: _isMetric,
+                  onTap: () => _onUnitToggle(true)),
+              const SizedBox(width: 8),
+              _UnitChip(
+                  label: 'ft',
+                  selected: !_isMetric,
+                  onTap: () => _onUnitToggle(false)),
+              const Spacer(),
+            ],
+          ),
+
+          const SizedBox(height: 12),
+
+          // Height input field
+          Container(
+            decoration: BoxDecoration(
+              border: Border.all(color: _DS.glassBorder),
+              borderRadius: BorderRadius.circular(12),
+              color: Colors.white.withAlpha(8),
+            ),
+            padding:
+                const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            child: TextField(
+              controller: _heightCtrl,
+              keyboardType:
+                  const TextInputType.numberWithOptions(decimal: true),
+              style: const TextStyle(
+                fontSize: 32,
+                fontWeight: FontWeight.w200,
+                color: _DS.textBright,
+                fontFeatures: [FontFeature.tabularFigures()],
+              ),
+              decoration: InputDecoration(
+                border: InputBorder.none,
+                suffix: Text(
+                  _isMetric ? 'm' : 'ft',
+                  style: const TextStyle(
+                      fontSize: 18, color: _DS.textDim),
+                ),
+              ),
+              onChanged: (_) =>
+                  setState(() => _validationError = null),
+            ),
+          ),
+
+          // Quick-pick presets
+          const SizedBox(height: 16),
+          const Text('COMMON HEIGHTS',
+              style: TextStyle(
+                  fontSize: 9, letterSpacing: 2, color: _DS.textDim)),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _PresetChip(
+                  label: 'Eye level  1.65 m',
+                  onTap: () => setState(() {
+                        _isMetric = true;
+                        _heightCtrl.text = '1.65';
+                        _validationError = null;
+                      })),
+              _PresetChip(
+                  label: 'Arm raised  2.10 m',
+                  onTap: () => setState(() {
+                        _isMetric = true;
+                        _heightCtrl.text = '2.10';
+                        _validationError = null;
+                      })),
+              _PresetChip(
+                  label: 'Chest  1.30 m',
+                  onTap: () => setState(() {
+                        _isMetric = true;
+                        _heightCtrl.text = '1.30';
+                        _validationError = null;
+                      })),
+            ],
+          ),
+
+          if (_validationError != null) ...[
+            const SizedBox(height: 12),
+            Text(_validationError!,
+                style: const TextStyle(
+                    fontSize: 11, color: Color(0xFFEF4444))),
+          ],
+
+          const SizedBox(height: 24),
+          // Next button
+          SizedBox(
+            width: double.infinity,
+            child: GestureDetector(
+              onTap: _onNext,
+              child: Container(
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    colors: [_DS.emerald, Color(0xFF059669)],
+                  ),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(
+                        widget.surveyorCtrl.hasOnboarded
+                            ? 'SAVE HEIGHT'
+                            : 'NEXT',
+                        style: const TextStyle(
+                            fontSize: 13,
+                            letterSpacing: 2.5,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.white)),
+                    const SizedBox(width: 8),
+                    Icon(
+                        widget.surveyorCtrl.hasOnboarded
+                            ? Icons.check_rounded
+                            : Icons.arrow_forward_rounded,
+                        size: 16,
+                        color: Colors.white),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Screen 2: Quick guide ─────────────────────────────────────────────────
+  Widget _buildGuideScreen() {
+    return _GlassPanel(
+      key: const ValueKey('screen_guide'),
+      padding: const EdgeInsets.all(28),      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header
+          Row(
+            children: [
+              Container(
+                width: 32,
+                height: 32,
+                decoration: BoxDecoration(
+                  color: _DS.amber.withAlpha(30),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Icon(Icons.menu_book_rounded,
+                    size: 18, color: _DS.amber),
+              ),
+              const SizedBox(width: 12),
+              const Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('SURVEYOR',
+                      style: TextStyle(
+                          fontSize: 10,
+                          letterSpacing: 2.5,
+                          color: _DS.amber,
+                          fontWeight: FontWeight.w600)),
+                  Text('Step 2 of 2 — Quick Guide',
+                      style: TextStyle(fontSize: 12, color: _DS.textDim)),
+                ],
+              ),
+              const Spacer(),
+              GestureDetector(
+                onTap: () {
+                  if (widget.surveyorCtrl.hasOnboarded) {
+                    widget.surveyorCtrl.state.value = SurveyorState.aimingBase;
+                  } else {
+                    widget.surveyorCtrl.deactivate();
+                  }
+                },
+                child: const Icon(Icons.close_rounded,
+                    color: _DS.textDim, size: 20),
+              ),
+            ],
+          ),
+
+          const SizedBox(height: 24),
+          const Text('How to measure',
+              style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w300,
+                  color: _DS.textBright)),
+
+          const SizedBox(height: 20),
+
+          // Step 1 card
+          _GuideStep(
+            number: '1',
+            color: _DS.amber,
+            icon: Icons.arrow_downward_rounded,
+            title: 'Aim at the BASE',
+            body:
+                'Point the crosshair at the bottom of the object. '
+                'Tap LOCK — the horizontal distance is calculated.',
+          ),
+
+          const SizedBox(height: 12),
+
+          // Step 2 card
+          _GuideStep(
+            number: '2',
+            color: _DS.emerald,
+            icon: Icons.arrow_upward_rounded,
+            title: 'Tilt up to the TOP',
+            body:
+                'Without moving your feet, tilt the phone up to '
+                'the top of the object. Tap LOCK — height is calculated.',
+          ),
+
+          const SizedBox(height: 8),
+
+          // Math note
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.white.withAlpha(6),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: _DS.glassBorder),
+            ),
+            child: const Text(
+              'Math:  d = h_eye / tan(α)  ·  H = h_eye + d × tan(β)',
+              style: TextStyle(
+                  fontSize: 10,
+                  color: _DS.textDim,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                  letterSpacing: 0.4),
+            ),
+          ),
+
+          const SizedBox(height: 24),
+
+          // Start button
+          SizedBox(
+            width: double.infinity,
+            child: GestureDetector(
+              onTap: widget.surveyorCtrl.startFromGuide,
+              child: Container(
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    colors: [_DS.emerald, Color(0xFF059669)],
+                  ),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: const Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.videocam_rounded,
+                        size: 18, color: Colors.white),
+                    SizedBox(width: 10),
+                    Text('START SURVEYING',
+                        style: TextStyle(
+                            fontSize: 13,
+                            letterSpacing: 2,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.white)),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// Small helper widgets for the onboarding screens ────────────────────────────
+
+class _UnitChip extends StatelessWidget {
+  const _UnitChip(
+      {required this.label,
+      required this.selected,
+      required this.onTap});
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => GestureDetector(
+        onTap: onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          padding:
+              const EdgeInsets.symmetric(horizontal: 16, vertical: 7),
+          decoration: BoxDecoration(
+            color: selected ? _DS.emerald : Colors.white.withAlpha(12),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+                color: selected ? _DS.emerald : _DS.glassBorder),
+          ),
+          child: Text(label,
+              style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: selected ? Colors.white : _DS.textDim)),
+        ),
+      );
+}
+
+class _PresetChip extends StatelessWidget {
+  const _PresetChip({required this.label, required this.onTap});
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => GestureDetector(
+        onTap: onTap,
+        child: Container(
+          padding:
+              const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: Colors.white.withAlpha(8),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: _DS.glassBorder),
+          ),
+          child: Text(label,
+              style: const TextStyle(
+                  fontSize: 11, color: _DS.textDim)),
+        ),
+      );
+}
+
+class _GuideStep extends StatelessWidget {
+  const _GuideStep({
+    required this.number,
+    required this.color,
+    required this.icon,
+    required this.title,
+    required this.body,
+  });
+  final String number;
+  final Color color;
+  final IconData icon;
+  final String title;
+  final String body;
+
+  @override
+  Widget build(BuildContext context) => Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: color.withAlpha(12),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: color.withAlpha(60)),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 32,
+              height: 32,
+              decoration: BoxDecoration(
+                  color: color, borderRadius: BorderRadius.circular(8)),
+              child: Center(
+                child: Text(number,
+                    style: const TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white)),
+              ),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(children: [
+                    Icon(icon, size: 13, color: color),
+                    const SizedBox(width: 5),
+                    Text(title,
+                        style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: color)),
+                  ]),
+                  const SizedBox(height: 5),
+                  Text(body,
+                      style: const TextStyle(
+                          fontSize: 12,
+                          color: _DS.textDim,
+                          height: 1.45)),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
+}
+
+// =============================================================================
+//  SURVEYOR UI — TOP PANEL  (live readings inside the glass inclinometer slot)
+// =============================================================================
+
+/// Replaces the inclinometer readout when the surveyor is actively measuring.
+///
+/// The outer [ValueListenableBuilder] on [surveyorCtrl.state] fires only on
+/// user action. The inner VLB on [levelCtrl.pitch] runs at 20 Hz — only the
+/// distance/height number and the angle chip rebuild.
+class _SurveyorTopPanel extends StatelessWidget {
+  const _SurveyorTopPanel({
+    required this.surveyorCtrl,
+    required this.levelCtrl,
+  });
+  final SurveyorController surveyorCtrl;
+  final LevelController levelCtrl;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<SurveyorState>(
+      valueListenable: surveyorCtrl.state,
+      builder: (_, state, _) {
+        if (state == SurveyorState.result) return _buildResultPanel();
+        return _buildLivePanel(state);
+      },
+    );
+  }
+
+  Widget _buildLivePanel(SurveyorState state) {
+    final isStep1 = state == SurveyorState.aimingBase;
+    return _GlassPanel(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Step label row
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                isStep1 ? 'STEP 1 OF 2' : 'STEP 2 OF 2',
+                style: const TextStyle(
+                    fontSize: 10, letterSpacing: 2.4, color: _DS.textDim),
+              ),
+              Text(
+                isStep1 ? 'AIM AT BASE  ↓' : 'AIM AT TOP  ↑',
+                style: TextStyle(
+                    fontSize: 10,
+                    letterSpacing: 1.8,
+                    fontWeight: FontWeight.w600,
+                    color: isStep1 ? _DS.amber : _DS.emerald),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+
+          // Live number — rebuilds at 20 Hz (only this text node)
+          ValueListenableBuilder<double>(
+            valueListenable: levelCtrl.pitch,
+            builder: (_, pitch, _) {
+              final calc = surveyorCtrl.calc;
+              final valid = calc.isAngleValid(pitch);
+
+              String readout;
+              Color color;
+              if (isStep1) {
+                readout = valid
+                    ? '${calc.distance(pitch).toStringAsFixed(2)} m'
+                    : '— m';
+                color = _DS.textBright;
+              } else {
+                final d = surveyorCtrl.lockedDistance.value;
+                if (d != null && valid) {
+                  readout =
+                      '${calc.objectHeight(pitch, d).toStringAsFixed(2)} m';
+                  color = _DS.emerald;
+                } else {
+                  readout = '— m';
+                  color = _DS.textBright;
+                }
+              }
+              return Text(
+                readout,
+                style: TextStyle(
+                  fontSize: 52,
+                  fontWeight: FontWeight.w100,
+                  letterSpacing: -1.5,
+                  color: color,
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                  shadows: color == _DS.emerald
+                      ? [
+                          Shadow(
+                              color: _DS.emerald.withAlpha(130),
+                              blurRadius: 28),
+                          Shadow(
+                              color: _DS.emerald.withAlpha(200),
+                              blurRadius: 8),
+                        ]
+                      : null,
+                ),
+              );
+            },
+          ),
+
+          // Pitch + locked distance sub-row
+          ValueListenableBuilder<double>(
+            valueListenable: levelCtrl.pitch,
+            builder: (_, pitch, _) => Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  'PITCH  ${pitch >= 0 ? '+' : ''}${pitch.toStringAsFixed(1)}°',
+                  style: const TextStyle(
+                      fontSize: 11,
+                      color: _DS.textDim,
+                      fontFeatures: [FontFeature.tabularFigures()]),
+                ),
+                if (!isStep1 &&
+                    surveyorCtrl.lockedDistance.value != null) ...[
+                  const Text('   ·   ',
+                      style: TextStyle(color: _DS.steel)),
+                  Text(
+                    'd = ${surveyorCtrl.lockedDistance.value!.toStringAsFixed(2)} m',
+                    style: TextStyle(
+                        fontSize: 11,
+                        color: _DS.amber,
+                        fontFeatures: const [
+                          FontFeature.tabularFigures()
+                        ]),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          // Edit Height action button inside Surveyor HUD
+          GestureDetector(
+            onTap: () {
+              HapticFeedback.selectionClick();
+              surveyorCtrl.editHeight();
+            },
+            behavior: HitTestBehavior.opaque,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: Colors.white.withAlpha(12),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: _DS.glassBorder, width: 0.8),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.height_rounded, size: 13, color: _DS.emerald),
+                  const SizedBox(width: 4),
+                  Text(
+                    'Eye Height: ${surveyorCtrl.userHeightM.toStringAsFixed(2)}m',
+                    style: const TextStyle(
+                      fontSize: 10,
+                      letterSpacing: 0.6,
+                      color: _DS.textDim,
+                      fontFeatures: [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  const Icon(Icons.edit_rounded, size: 11, color: _DS.textBright),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildResultPanel() {
+    return ValueListenableBuilder<double?>(
+      valueListenable: surveyorCtrl.measuredHeight,
+      builder: (_, height, _) => ValueListenableBuilder<double?>(
+        valueListenable: surveyorCtrl.lockedDistance,
+        builder: (_, distance, _) => _GlassPanel(
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('MEASUREMENT COMPLETE',
+                  style: TextStyle(
+                      fontSize: 10,
+                      letterSpacing: 2.4,
+                      color: _DS.emerald,
+                      fontWeight: FontWeight.w600)),
+              const SizedBox(height: 8),
+              Text(
+                height != null
+                    ? '${height.toStringAsFixed(2)} m'
+                    : '— m',
+                style: const TextStyle(
+                  fontSize: 58,
+                  fontWeight: FontWeight.w100,
+                  letterSpacing: -2,
+                  color: _DS.emerald,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                  shadows: [
+                    Shadow(
+                        color: Color(0x8010B981), blurRadius: 32),
+                    Shadow(
+                        color: Color(0xCC10B981), blurRadius: 10),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 4),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Text('OBJECT HEIGHT   ',
+                      style: TextStyle(
+                          fontSize: 10,
+                          letterSpacing: 1.8,
+                          color: _DS.textDim)),
+                  if (distance != null)
+                    Text(
+                      'distance ${distance.toStringAsFixed(2)} m',
+                      style: const TextStyle(
+                          fontSize: 10,
+                          color: _DS.amber,
+                          fontFeatures: [
+                            FontFeature.tabularFigures()
+                          ]),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              GestureDetector(
+                onTap: () {
+                  HapticFeedback.selectionClick();
+                  surveyorCtrl.editHeight();
+                },
+                behavior: HitTestBehavior.opaque,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withAlpha(12),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: _DS.glassBorder, width: 0.8),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.height_rounded, size: 13, color: _DS.emerald),
+                      const SizedBox(width: 4),
+                      Text(
+                        'Eye Height: ${surveyorCtrl.userHeightM.toStringAsFixed(2)}m',
+                        style: const TextStyle(
+                          fontSize: 10,
+                          letterSpacing: 0.6,
+                          color: _DS.textDim,
+                          fontFeatures: [FontFeature.tabularFigures()],
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      const Icon(Icons.edit_rounded, size: 11, color: _DS.textBright),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// =============================================================================
+//  SURVEYOR UI — BOTTOM ACTION PANEL  (lock buttons + exit)
+// =============================================================================
+
+/// Replaces the Pro-Tools dock when the surveyor is actively measuring.
+/// The glass panel is static (BackdropFilter outside all hot-path VLBs).
+/// Only the lock button label rebuilds via a state VLB — user-action frequency.
+class _SurveyorBottomPanel extends StatelessWidget {
+  const _SurveyorBottomPanel({
+    required this.surveyorCtrl,
+    required this.levelCtrl,
+    required this.state,
+  });
+  final SurveyorController surveyorCtrl;
+  final LevelController levelCtrl;
+  final SurveyorState state;
+
+  @override
+  Widget build(BuildContext context) {
+    return _GlassPanel(
+      borderRadius: const BorderRadius.only(
+        topLeft: Radius.circular(24),
+        topRight: Radius.circular(24),
+      ),
+      padding: const EdgeInsets.fromLTRB(20, 18, 20, 36),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Drag handle
+          Container(
+            width: 36,
+            height: 3,
+            margin: const EdgeInsets.only(bottom: 16),
+            decoration: BoxDecoration(
+              color: _DS.glassBorder,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+
+          if (state == SurveyorState.result) ...[
+            // ── Result actions ─────────────────────────────────────────────
+            Row(
+              children: [
+                Expanded(
+                  child: _SurveyorActionButton(
+                    icon: Icons.replay_rounded,
+                    label: 'REMEASURE',
+                    color: _DS.amber,
+                    onTap: surveyorCtrl.remeasure,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _SurveyorActionButton(
+                    icon: Icons.check_rounded,
+                    label: 'DONE',
+                    color: _DS.emerald,
+                    onTap: surveyorCtrl.deactivate,
+                  ),
+                ),
+              ],
+            ),
+          ] else ...[
+            // ── Step instructions ──────────────────────────────────────────
+            Text(
+              state == SurveyorState.aimingBase
+                  ? 'Point crosshair at the BASE of the object, then lock.'
+                  : 'Tilt up to the TOP of the object, then lock.',
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                  fontSize: 12, color: _DS.textDim, height: 1.4),
+            ),
+            const SizedBox(height: 16),
+            // ── Big LOCK button ────────────────────────────────────────────
+            ValueListenableBuilder<double>(
+              valueListenable: levelCtrl.pitch,
+              builder: (_, pitch, _) {
+                final valid = surveyorCtrl.calc.isAngleValid(pitch);
+                return GestureDetector(
+                  onTap: () {
+                    if (!valid) return;
+                    if (state == SurveyorState.aimingBase) {
+                      surveyorCtrl.lockBase(pitch);
+                    } else {
+                      surveyorCtrl.lockTop(pitch);
+                    }
+                  },
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 200),
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(vertical: 18),
+                    decoration: BoxDecoration(
+                      gradient: valid
+                          ? const LinearGradient(
+                              colors: [_DS.emerald, Color(0xFF059669)])
+                          : null,
+                      color: valid ? null : _DS.steel,
+                      borderRadius: BorderRadius.circular(16),
+                      boxShadow: valid
+                          ? [
+                              BoxShadow(
+                                  color: _DS.emerald.withAlpha(80),
+                                  blurRadius: 20,
+                                  spreadRadius: 2)
+                            ]
+                          : null,
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.lock_rounded,
+                            size: 20,
+                            color: valid
+                                ? Colors.white
+                                : Colors.white38),
+                        const SizedBox(width: 10),
+                        Text(
+                          state == SurveyorState.aimingBase
+                              ? 'LOCK BASE'
+                              : 'LOCK TOP',
+                          style: TextStyle(
+                            fontSize: 14,
+                            letterSpacing: 2.5,
+                            fontWeight: FontWeight.w700,
+                            color: valid
+                                ? Colors.white
+                                : Colors.white38,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+            const SizedBox(height: 12),
+            // ── Exit link ──────────────────────────────────────────────────
+            GestureDetector(
+              onTap: surveyorCtrl.deactivate,
+              child: const Text('EXIT SURVEYOR',
+                  style: TextStyle(
+                      fontSize: 10,
+                      letterSpacing: 2,
+                      color: _DS.textDim,
+                      decoration: TextDecoration.underline,
+                      decorationColor: _DS.textDim)),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _SurveyorActionButton extends StatelessWidget {
+  const _SurveyorActionButton({
+    required this.icon,
+    required this.label,
+    required this.color,
+    required this.onTap,
+  });
+  final IconData icon;
+  final String label;
+  final Color color;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => GestureDetector(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          decoration: BoxDecoration(
+            color: color.withAlpha(28),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: color.withAlpha(100)),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, size: 18, color: color),
+              const SizedBox(width: 8),
+              Text(label,
+                  style: TextStyle(
+                      fontSize: 12,
+                      letterSpacing: 1.8,
+                      fontWeight: FontWeight.w600,
+                      color: color)),
+            ],
+          ),
+        ),
+      );
+}
+
+// =============================================================================
+//  PAINTER : CROSSHAIR  (AR Surveyor overlay — purely static)
+// =============================================================================
+
+/// Draws a precision camera crosshair over the level canvas.
+/// No sensor data is consumed — [shouldRepaint] only returns true when
+/// [isLocked] changes (on user action, not at sensor frequency).
+class _CrosshairPainter extends CustomPainter {
+  const _CrosshairPainter({required this.isLocked});
+  final bool isLocked;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final cx = size.width  / 2;
+    final cy = size.height / 2;
+
+    final lineColor = isLocked ? _DS.emerald : Colors.white.withAlpha(200);
+    final dimColor  = lineColor.withAlpha(40);
+
+    final thinPaint = Paint()
+      ..color = lineColor
+      ..strokeWidth = 1.0
+      ..style = PaintingStyle.stroke;
+
+    final dimPaint = Paint()
+      ..color = dimColor
+      ..strokeWidth = 0.5
+      ..style = PaintingStyle.stroke;
+
+    // Full-width horizon guide line
+    canvas.drawLine(Offset(0, cy), Offset(size.width, cy), dimPaint);
+
+    // Crosshair lines with centre gap
+    const gap = 18.0;
+    const arm = 52.0;
+    // horizontal
+    canvas.drawLine(Offset(cx - arm - gap, cy), Offset(cx - gap, cy), thinPaint);
+    canvas.drawLine(Offset(cx + gap, cy), Offset(cx + arm + gap, cy), thinPaint);
+    // vertical
+    canvas.drawLine(Offset(cx, cy - arm - gap), Offset(cx, cy - gap), thinPaint);
+    canvas.drawLine(Offset(cx, cy + gap), Offset(cx, cy + arm + gap), thinPaint);
+
+    // Centre ring
+    canvas.drawCircle(Offset(cx, cy), gap - 2, thinPaint..strokeWidth = 1.2);
+
+    // Glow when locked
+    if (isLocked) {
+      canvas.drawCircle(
+        Offset(cx, cy),
+        gap + 6,
+        Paint()
+          ..color = _DS.emerald.withAlpha(55)
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10),
+      );
+    }
+
+    // Corner bracket helper
+    void bracket(double x, double y, double dx, double dy) {
+      const s = 16.0;
+      canvas.drawLine(Offset(x, y), Offset(x + dx * s, y), thinPaint..strokeWidth = 1.5);
+      canvas.drawLine(Offset(x, y), Offset(x, y + dy * s), thinPaint..strokeWidth = 1.5);
+    }
+
+    const m = 44.0; // margin from centre
+    bracket(cx - m, cy - m,  1,  1); // top-left
+    bracket(cx + m, cy - m, -1,  1); // top-right
+    bracket(cx - m, cy + m,  1, -1); // bottom-left
+    bracket(cx + m, cy + m, -1, -1); // bottom-right
+
+    // Step labels
+    final tp = TextPainter(textDirection: TextDirection.ltr);
+    tp.text = TextSpan(
+      text: isLocked ? 'STEP 2 — AIM AT TOP' : 'STEP 1 — AIM AT BASE',
+      style: TextStyle(
+        fontSize: 10,
+        letterSpacing: 1.6,
+        color: lineColor,
+        fontWeight: FontWeight.w500,
+      ),
+    );
+    tp.layout();
+    tp.paint(canvas, Offset(cx - tp.width / 2, cy + arm + gap + 10));
+  }
+
+  @override
+  bool shouldRepaint(_CrosshairPainter old) => old.isLocked != isLocked;
 }
 
 // =============================================================================
